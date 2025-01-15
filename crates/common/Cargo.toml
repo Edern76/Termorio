@@ -1,0 +1,10 @@
+[package]
+name = "termorio_common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uuid = { workspace = true, features = ["v4", "serde"] }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+interprocess = { workspace = true, features = ["tokio"] }

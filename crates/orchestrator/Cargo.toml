@@ -1,0 +1,14 @@
+[package]
+name = "termorio_orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+termorio_common = { path = "../common" }
+serde = { workspace = true, features = ["derive"] }
+dashmap = { workspace = true, features = ["serde"] }
+bytes = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["full"] }
+interprocess = { workspace = true, features = ["tokio"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+bincode = { workspace = true }

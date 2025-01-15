@@ -1,0 +1,12 @@
+[package]
+name = "termorio_factory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+termorio_common = { path = "../common" }
+tokio = { workspace = true, features = ["full"] }
+interprocess = { workspace = true, features = ["tokio"] }
+bytes = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+bincode = { workspace = true }

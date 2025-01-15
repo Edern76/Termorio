@@ -1,0 +1,7 @@
+[package]
+name = "termorio_builder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+termorio_common = { path = "../common"}
