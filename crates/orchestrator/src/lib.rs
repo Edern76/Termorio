@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use termorio_common::constants as Constants;
 use termorio_common::ipc::{
-    get_factory_ipc_socket_path, open_socket, RegistrationMessage, SocketRole, StatusUpdateMessage,
+    get_factory_ipc_socket_path, get_raw_socket, open_socket, receive_from_socket, send_in_socket,
+    RegistrationMessage, SocketRole, StatusUpdateMessage,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
@@ -39,7 +40,7 @@ enum FactoryChangeEvent {
 
 struct FactoryConnection {
     name: String,
-    socket: Option<Stream>,
+    socket: Option<Listener>,
     status: FactoryStatus,
 }
 
@@ -121,9 +122,18 @@ impl Orchestrator {
 
                     let handle = tokio::spawn(async move {
                         if let Some(factory) = factories_arc.get_mut(&factory_id) {
-                            Self::handle_factory_status_task(factory, factories_events_arc)
+                            let name = factory.name.clone();
+                            match Self::handle_factory_status_task(factory, factories_events_arc)
                                 .await
-                                .expect("Uncaught error during factory creation");
+                            {
+                                Ok(_) => {}
+                                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                                    eprintln!("Factory {name} timed out",);
+                                }
+                                Err(e) => {
+                                    panic!("Uncaught error during factory creation: {}", e);
+                                }
+                            }
                         }
                     });
                     active_tasks.insert(factory_id, handle);
@@ -137,70 +147,102 @@ impl Orchestrator {
         }
     }
 
+    // TODO : Replace some Err(e) with Ok(), or handle them upstream
+    // If the factory dies and this catches it, then it is intended behaviour and we should gracefully end the task
     async fn handle_factory_status_task(
         mut factory: RefMut<'_, Uuid, FactoryConnection>,
         factory_sender: Arc<broadcast::Sender<FactoryChangeEvent>>,
     ) -> Result<(), io::Error> {
         let mut mut_factory = factory.value_mut();
         let name = mut_factory.name.clone();
-        let mut inc = if let Some(mut socket) = mut_factory.socket.take() {
+        let mut listener = if let Some(mut socket) = mut_factory.socket.as_mut() {
             socket
         } else {
             panic!("Factory {} socket is None", &factory.key().to_string());
         };
 
-        let mut buffer = BytesMut::with_capacity(Constants::STATUS_UPDATE_BUFFER_SIZE);
-
         eprintln!("Status task listening for updates for {}", name);
+        let mut inc = listener.accept().await?;
 
         loop {
             let message = bincode::serialize(&StatusUpdateMessage::RequestStatus).unwrap();
 
-            match inc.write_all(&message).await {
+            match send_in_socket(&mut inc, &message).await {
                 Ok(_) => {
-                    if let Err(e) = timeout(
+                    match timeout(
                         Constants::STATUS_MESSAGE_REQUEST_TIMEOUT,
-                        inc.read(&mut buffer),
+                        receive_from_socket(&mut inc),
                     )
                     .await
                     {
-                        mut_factory.status = FactoryStatus::Stopped;
-                        return Err(io::Error::new(
-                            ErrorKind::TimedOut,
-                            format!("Status update message timed out: {}", e),
-                        ));
-                    } else {
-                        let message = match bincode::deserialize::<StatusUpdateMessage>(&buffer) {
-                            Ok(message) => message,
-                            Err(e) => {
-                                mut_factory.status = FactoryStatus::Dead;
-                                return Err(io::Error::new(
-                                    ErrorKind::Other,
-                                    format!("Failed to deserialize status update message: {}", e),
-                                ));
-                            }
-                        };
-
-                        let status = match message {
-                            StatusUpdateMessage::Status { status } => match status {
-                                Ok(_) => FactoryStatus::Running,
-                                Err(_) => FactoryStatus::Dead,
-                            },
-                            _ => FactoryStatus::Dead,
-                        };
-
-                        mut_factory.status = status.clone();
-                        if status != FactoryStatus::Running {
+                        Err(e) => {
+                            mut_factory.status = FactoryStatus::Stopped;
                             return Err(io::Error::new(
-                                ErrorKind::Other,
-                                format!("Factory {} is not running", name),
+                                ErrorKind::TimedOut,
+                                format!("Status update message timed out: {}", e),
                             ));
                         }
+                        Ok(res) => match res {
+                            Ok(buffer) => {
+                                let message =
+                                    match bincode::deserialize::<StatusUpdateMessage>(&buffer) {
+                                        Ok(message) => message,
+                                        Err(e) => {
+                                            mut_factory.status = FactoryStatus::Dead;
+                                            return Err(io::Error::new(
+                                                ErrorKind::Other,
+                                                format!(
+                                                "Failed to deserialize status update message: {}",
+                                                e
+                                            ),
+                                            ));
+                                        }
+                                    };
+
+                                let status = match message {
+                                    StatusUpdateMessage::Status { status } => match status {
+                                        Ok(_) => FactoryStatus::Running,
+                                        Err(_) => FactoryStatus::Dead,
+                                    },
+                                    StatusUpdateMessage::Stopping => FactoryStatus::Stopped,
+                                    _ => FactoryStatus::Dead,
+                                };
+
+                                mut_factory.status = status.clone();
+                                match status {
+                                    FactoryStatus::Running => {}
+                                    FactoryStatus::Stopped => {
+                                        eprintln!("Factory {} stopped", &name);
+                                        return Ok(());
+                                    }
+                                    FactoryStatus::Dead => {
+                                        return Err(io::Error::new(
+                                            ErrorKind::Other,
+                                            format!("Factory {} is not running", &name),
+                                        ));
+                                    }
+                                    FactoryStatus::Uninitialized => {
+                                        unreachable!("How the fuck is this even possible ?");
+                                    }
+                                }
+
+                                sleep(Constants::STATUS_MESSAGE_REQUEST_INTERVAL).await;
+                            }
+                            Err(e) => {
+                                return Err(io::Error::new(
+                                    ErrorKind::ConnectionAborted,
+                                    format!("Connection error during factory status check : {}", e),
+                                ));
+                            }
+                        },
                     }
-                    sleep(Constants::STATUS_MESSAGE_REQUEST_INTERVAL).await;
                 }
                 Err(e) => {
-                    eprintln!("Failed to send status update message: {}", e);
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        eprintln!("Connection to factory {} closed", name);
+                        mut_factory.status = FactoryStatus::Stopped; // TODO : Maybe dead, but we'd need to rewrite unregister to set it to stopped.
+                        return Ok(()); // TODO : Figure out if we want to keep this. If we handle Errs upstream, this becomes an Err.
+                    }
                     sleep(Constants::STATUS_MESSAGE_REQUEST_RETRY_INTERVAL).await;
                     continue;
                 }
@@ -214,25 +256,22 @@ impl Orchestrator {
         factories_events_arc: Arc<broadcast::Sender<FactoryChangeEvent>>,
     ) -> Result<(), io::Error> {
         eprintln!("Starting registration task...");
-        let mut stream = match open_socket(registration_socket, SocketRole::Server).await {
+        let mut listener = match get_raw_socket(registration_socket, SocketRole::Server).await {
             Err(e) => {
                 panic!("Shutting down registering task due to error : {e}");
             }
-            Ok(stream) => stream,
+            Ok(listen) => listen,
         };
 
         eprintln!("Registration thread listening...");
 
         loop {
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await?;
-            let response_len = u32::from_le_bytes(len_buf);
-            eprintln!("Received registration message of length {}", &response_len);
-
-            let mut buffer = vec![0u8; response_len as usize];
-
-            match stream.read_exact(&mut buffer).await {
-                Ok(_) => {
+            eprintln!("Ready to accept a new connection");
+            let mut stream = listener.accept().await?;
+            eprintln!("Ready to receive another message");
+            match receive_from_socket(&stream).await {
+                Ok(buf) => {
+                    let buffer = buf;
                     eprintln!("Received registration message inside match",);
                     let message = match bincode::deserialize::<RegistrationMessage>(&buffer) {
                         Ok(message) => message,
@@ -250,7 +289,9 @@ impl Orchestrator {
 
                     match bincode::serialize(&result) {
                         Ok(bytes) => {
-                            stream.write_all(&bytes).await?;
+                            eprintln!("Sending registration response");
+                            send_in_socket(&stream, &bytes).await?;
+                            eprintln!("Response sent");
                         }
                         Err(e) => {
                             eprintln!("Failed to serialize registration message: {}", e);
@@ -263,7 +304,6 @@ impl Orchestrator {
                     continue;
                 }
             }
-            buffer.clear();
         }
     }
 
@@ -276,13 +316,12 @@ impl Orchestrator {
             RegistrationMessage::Register { factory_name } => {
                 eprintln!("Registering factory {}", &factory_name);
                 let uuid = Uuid::new_v4();
-                let inc = match open_socket(
-                    get_factory_ipc_socket_path(&factory_name),
-                    SocketRole::Server,
-                )
-                .await
-                {
-                    Ok(stream) => stream,
+                let socket_path = get_factory_ipc_socket_path(&uuid.to_string());
+                eprintln!("Attempting to create socket at : {}", &socket_path);
+                let _ = std::fs::remove_file(&socket_path);
+                eprintln!("Done with removing file");
+                let listener = match get_raw_socket(socket_path.clone(), SocketRole::Server).await {
+                    Ok(listen) => listen,
                     Err(e) => {
                         return Err(RegistrationMessage::Error {
                             error: format!("Failed to open socket: {}", e),
@@ -290,14 +329,18 @@ impl Orchestrator {
                     }
                 };
 
+                eprintln!("Status socket opened for factory {}", &factory_name);
+
                 arc_factories.insert(
                     uuid,
                     FactoryConnection {
                         name: factory_name.clone(),
-                        socket: Some(inc),
+                        socket: Some(listener),
                         status: FactoryStatus::Running,
                     },
                 );
+
+                eprintln!("Factory {} registered", &factory_name);
 
                 if let Err(e) = factories_events_arc.send(FactoryChangeEvent::Added(uuid)) {
                     arc_factories.get_mut(&uuid).unwrap().status = FactoryStatus::Dead;
@@ -308,10 +351,12 @@ impl Orchestrator {
 
                 Ok(RegistrationMessage::Registered {
                     factory_id: uuid,
-                    socket_name: get_factory_ipc_socket_path(&factory_name),
+                    socket_name: socket_path.to_owned(),
                 })
             }
             RegistrationMessage::Unregister { factory_id } => {
+                eprintln!("Unregistering factory {}", &factory_id);
+
                 arc_factories
                     .get_mut(&factory_id)
                     .and_then(|mut factory| factory.socket.take());

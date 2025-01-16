@@ -23,4 +23,5 @@ pub enum RegistrationMessage {
 pub enum StatusUpdateMessage {
     RequestStatus,
     Status { status: Result<(), ()> },
+    Stopping,
 }
