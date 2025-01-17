@@ -9,3 +9,4 @@ pub static STATUS_MESSAGE_REQUEST_INTERVAL: Duration = Duration::from_millis(500
 pub static STATUS_MESSAGE_REQUEST_TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub static ORCHESTRATOR_SOCKET_NAME: &str = "termorio_orchestrator";
+pub static STATUS_DISPLAY_INTERVAL: Duration = Duration::from_millis(200);

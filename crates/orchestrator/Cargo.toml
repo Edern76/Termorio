@@ -12,3 +12,4 @@ tokio = { workspace = true, features = ["full"] }
 interprocess = { workspace = true, features = ["tokio"] }
 uuid = { workspace = true, features = ["v4", "serde"] }
 bincode = { workspace = true }
+papaya = { workspace = true }

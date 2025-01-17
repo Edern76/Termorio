@@ -1,3 +1,6 @@
+pub mod types;
+
+use crate::types::{FactoriesMap, FactoryConnection, FactoryStatus};
 use bytes::BytesMut;
 use dashmap::mapref::one::{Ref, RefMut};
 use dashmap::DashMap;
@@ -23,25 +26,11 @@ use tokio::time::{sleep, timeout};
 use tokio::{join, select};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq)]
-enum FactoryStatus {
-    Running,
-    Stopped,
-    Dead,
-    Uninitialized,
-}
-
 #[derive(Debug, Clone)]
 enum FactoryChangeEvent {
     Added(Uuid),
     Removed(Uuid),
     StatusChanged(Uuid, FactoryStatus),
-}
-
-struct FactoryConnection {
-    name: String,
-    socket: Option<Listener>,
-    status: FactoryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +39,7 @@ pub struct OrchestratorConfig {
 }
 
 pub struct Orchestrator {
-    factories: Arc<DashMap<Uuid, FactoryConnection>>,
+    pub factories: FactoriesMap,
     factories_events: Arc<broadcast::Sender<FactoryChangeEvent>>,
     config: OrchestratorConfig,
 }
@@ -61,10 +50,14 @@ impl Orchestrator {
             broadcast::channel::<FactoryChangeEvent>(Constants::ORCHESTRATOR_EVENT_QUEUE_SIZE);
 
         Self {
-            factories: Arc::new(DashMap::new()),
+            factories: Arc::new(papaya::HashMap::new()),
             factories_events: Arc::new(tx),
             config,
         }
+    }
+
+    pub fn get_factories_ref(&self) -> FactoriesMap {
+        Arc::clone(&self.factories)
     }
 
     pub async fn run(&mut self) -> (TokioJoinHandle<()>, TokioJoinHandle<()>) {
@@ -95,7 +88,7 @@ impl Orchestrator {
 
     async fn status_tasks_spawner_task(
         factories_events_arc: Arc<broadcast::Sender<FactoryChangeEvent>>,
-        factories_arc: Arc<DashMap<Uuid, FactoryConnection>>,
+        factories_arc: FactoriesMap,
     ) -> Result<(), io::Error> {
         let sender_status = factories_events_arc.clone();
         let mut rx = factories_events_arc.subscribe();
@@ -121,8 +114,9 @@ impl Orchestrator {
                     let factories_events_arc = Arc::clone(&sender_status);
 
                     let handle = tokio::spawn(async move {
-                        if let Some(factory) = factories_arc.get_mut(&factory_id) {
-                            let name = factory.name.clone();
+                        let factories_arc = factories_arc.pin_owned();
+                        if let Some(factory) = factories_arc.get_key_value(&factory_id) {
+                            let name = factory.1.name.clone();
                             match Self::handle_factory_status_task(factory, factories_events_arc)
                                 .await
                             {
@@ -142,7 +136,14 @@ impl Orchestrator {
                     let handle = active_tasks.remove(&factory_id).unwrap();
                     handle.abort();
                 }
-                _ => {} // Not this task's business
+                FactoryChangeEvent::StatusChanged(factory_id, new_status) => {
+                    let factories_arc = factories_arc.pin_owned();
+                    factories_arc.update(factory_id, |conn| FactoryConnection {
+                        name: conn.name.to_owned(),
+                        socket: Arc::clone(&conn.socket),
+                        status: new_status.clone(),
+                    });
+                } // Not this task's business
             }
         }
     }
@@ -150,15 +151,25 @@ impl Orchestrator {
     // TODO : Replace some Err(e) with Ok(), or handle them upstream
     // If the factory dies and this catches it, then it is intended behaviour and we should gracefully end the task
     async fn handle_factory_status_task(
-        mut factory: RefMut<'_, Uuid, FactoryConnection>,
+        mut factory: (&Uuid, &FactoryConnection),
         factory_sender: Arc<broadcast::Sender<FactoryChangeEvent>>,
     ) -> Result<(), io::Error> {
-        let mut mut_factory = factory.value_mut();
-        let name = mut_factory.name.clone();
-        let mut listener = if let Some(mut socket) = mut_factory.socket.as_mut() {
+        let (uuid_ref) = factory.0;
+        let (factory_ref) = factory.1;
+
+        let name;
+        let uuid;
+        let mut listener;
+
+        uuid = uuid_ref.clone().to_owned();
+
+        let immut_factory = factory_ref; // TODO : Other name for that
+        name = immut_factory.name.clone();
+        let mut lock = immut_factory.socket.lock().await;
+        listener = if let Some(mut socket) = lock.as_mut() {
             socket
         } else {
-            panic!("Factory {} socket is None", &factory.key().to_string());
+            panic!("Factory {} socket is None", &uuid);
         };
 
         eprintln!("Status task listening for updates for {}", name);
@@ -176,7 +187,13 @@ impl Orchestrator {
                     .await
                     {
                         Err(e) => {
-                            mut_factory.status = FactoryStatus::Stopped;
+                            {
+                                if let Err(e) = factory_sender.send(
+                                    FactoryChangeEvent::StatusChanged(uuid, FactoryStatus::Stopped),
+                                ) {
+                                    eprintln!("Failed to send status change event: {}", e);
+                                }
+                            }
                             return Err(io::Error::new(
                                 ErrorKind::TimedOut,
                                 format!("Status update message timed out: {}", e),
@@ -188,7 +205,19 @@ impl Orchestrator {
                                     match bincode::deserialize::<StatusUpdateMessage>(&buffer) {
                                         Ok(message) => message,
                                         Err(e) => {
-                                            mut_factory.status = FactoryStatus::Dead;
+                                            {
+                                                if let Err(e) = factory_sender.send(
+                                                    FactoryChangeEvent::StatusChanged(
+                                                        uuid,
+                                                        FactoryStatus::Dead,
+                                                    ),
+                                                ) {
+                                                    eprintln!(
+                                                        "Failed to send status change event : {}",
+                                                        e
+                                                    )
+                                                }
+                                            }
                                             return Err(io::Error::new(
                                                 ErrorKind::Other,
                                                 format!(
@@ -208,7 +237,20 @@ impl Orchestrator {
                                     _ => FactoryStatus::Dead,
                                 };
 
-                                mut_factory.status = status.clone();
+                                {
+                                    let mut mut_factory = factory_ref; // TODO: Rename this, maybe remove reassignment, I'm just too done with this shit to care right now
+                                    let new_status = status.clone();
+                                    let factory_status = mut_factory.status.clone();
+                                    if new_status != factory_status {
+                                        if let Err(e) = factory_sender.send(
+                                            FactoryChangeEvent::StatusChanged(uuid, new_status),
+                                        ) {
+                                            eprintln!("Failed to send unregistration event: {}", e);
+                                            // Should be recoverable, since the socket got dropped anyway
+                                        }
+                                    }
+                                }
+
                                 match status {
                                     FactoryStatus::Running => {}
                                     FactoryStatus::Stopped => {
@@ -225,7 +267,6 @@ impl Orchestrator {
                                         unreachable!("How the fuck is this even possible ?");
                                     }
                                 }
-
                                 sleep(Constants::STATUS_MESSAGE_REQUEST_INTERVAL).await;
                             }
                             Err(e) => {
@@ -240,8 +281,16 @@ impl Orchestrator {
                 Err(e) => {
                     if e.kind() == io::ErrorKind::BrokenPipe {
                         eprintln!("Connection to factory {} closed", name);
-                        mut_factory.status = FactoryStatus::Stopped; // TODO : Maybe dead, but we'd need to rewrite unregister to set it to stopped.
-                        return Ok(()); // TODO : Figure out if we want to keep this. If we handle Errs upstream, this becomes an Err.
+                        {
+                            if let Err(e) = factory_sender.send(FactoryChangeEvent::StatusChanged(
+                                uuid,
+                                FactoryStatus::Stopped,
+                            )) {
+                                eprintln!("Failed to send unregistration event: {}", e);
+                                // Should be recoverable, since the socket got dropped anyway
+                            }
+                        }
+                        return Ok(());
                     }
                     sleep(Constants::STATUS_MESSAGE_REQUEST_RETRY_INTERVAL).await;
                     continue;
@@ -252,7 +301,7 @@ impl Orchestrator {
 
     async fn registration_task(
         registration_socket: String,
-        registration_factories_arc: Arc<DashMap<Uuid, FactoryConnection>>,
+        registration_factories_arc: FactoriesMap,
         factories_events_arc: Arc<broadcast::Sender<FactoryChangeEvent>>,
     ) -> Result<(), io::Error> {
         eprintln!("Starting registration task...");
@@ -281,12 +330,16 @@ impl Orchestrator {
                     };
                     let result = Self::handle_message(
                         message,
-                        registration_factories_arc.clone(),
-                        factories_events_arc.clone(),
+                        Arc::clone(&registration_factories_arc),
+                        Arc::clone(&factories_events_arc),
                     )
                     .await
                     .unwrap_or_else(|message| message);
 
+                    eprintln!(
+                        "Factories map length outside message handler : {}",
+                        registration_factories_arc.len()
+                    );
                     match bincode::serialize(&result) {
                         Ok(bytes) => {
                             eprintln!("Sending registration response");
@@ -309,7 +362,7 @@ impl Orchestrator {
 
     async fn handle_message(
         message: RegistrationMessage,
-        arc_factories: Arc<DashMap<Uuid, FactoryConnection>>,
+        arc_factories: FactoriesMap,
         factories_events_arc: Arc<broadcast::Sender<FactoryChangeEvent>>,
     ) -> Result<RegistrationMessage, RegistrationMessage> {
         match message {
@@ -331,19 +384,30 @@ impl Orchestrator {
 
                 eprintln!("Status socket opened for factory {}", &factory_name);
 
-                arc_factories.insert(
+                let map = arc_factories.pin_owned();
+                let socket = Arc::new(tokio::sync::Mutex::new(Some(listener)));
+                map.insert(
                     uuid,
                     FactoryConnection {
                         name: factory_name.clone(),
-                        socket: Some(listener),
+                        socket,
                         status: FactoryStatus::Running,
                     },
                 );
 
+                eprintln!(
+                    "Inserted factory at map address: {:p}",
+                    Arc::as_ptr(&arc_factories)
+                );
                 eprintln!("Factory {} registered", &factory_name);
+                eprintln!("Arc factories new length : {}", arc_factories.len());
 
                 if let Err(e) = factories_events_arc.send(FactoryChangeEvent::Added(uuid)) {
-                    arc_factories.get_mut(&uuid).unwrap().status = FactoryStatus::Dead;
+                    map.update(uuid, |conn| FactoryConnection {
+                        name: conn.name.to_owned(),
+                        socket: Arc::clone(&conn.socket),
+                        status: FactoryStatus::Dead,
+                    });
                     return Err(RegistrationMessage::Error {
                         error: format!("Failed to send registration event: {}", e),
                     });
@@ -357,9 +421,12 @@ impl Orchestrator {
             RegistrationMessage::Unregister { factory_id } => {
                 eprintln!("Unregistering factory {}", &factory_id);
 
-                arc_factories
-                    .get_mut(&factory_id)
-                    .and_then(|mut factory| factory.socket.take());
+                let map = arc_factories.pin_owned();
+                map.update(factory_id, |conn| FactoryConnection {
+                    name: conn.name.to_owned(),
+                    socket: Arc::new(None.into()),
+                    status: FactoryStatus::Stopped,
+                });
 
                 if let Err(e) = factories_events_arc.send(FactoryChangeEvent::Removed(factory_id)) {
                     eprintln!("Failed to send unregistration event: {}", e); // Should be recoverable, since the socket got dropped anyway

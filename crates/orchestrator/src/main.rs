@@ -2,6 +2,8 @@ use termorio_common::constants as Constants;
 use termorio_orchestrator::{Orchestrator, OrchestratorConfig};
 use tokio::select;
 
+mod display;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conf = OrchestratorConfig {
@@ -10,8 +12,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut orchestrator = Orchestrator::new(conf);
     let (reg_handle, statuses_handle) = orchestrator.run().await;
+    let display_handle = display::display_task(orchestrator.get_factories_ref())?;
 
-    println!("Orchestrator running, waiting for connections..."); // Add logging
+    println!("Orchestrator running, waiting for connections...");
 
     // Add error handling for the join handle
     let result = select! {
@@ -35,6 +38,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                  Err(e) => {
                     println!("Status task failed: {}", &e);
+                    Err(e)
+                }
+            }
+        }
+        display_result = display_handle => {
+            match display_result {
+                 Ok(_) => {
+                    println!("Display task completed first (should not happen)");
+                    Ok(())
+                }
+                 Err(e) => {
+                    println!("Display task crashed: {}", &e);
                     Err(e)
                 }
             }
