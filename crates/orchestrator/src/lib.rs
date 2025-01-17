@@ -138,10 +138,8 @@ impl Orchestrator {
                 }
                 FactoryChangeEvent::StatusChanged(factory_id, new_status) => {
                     let factories_arc = factories_arc.pin_owned();
-                    factories_arc.update(factory_id, |conn| FactoryConnection {
-                        name: conn.name.to_owned(),
-                        socket: Arc::clone(&conn.socket),
-                        status: new_status.clone(),
+                    factories_arc.update(factory_id, |conn| {
+                        conn.get_copy_with_different_status(new_status)
                     });
                 } // Not this task's business
             }
@@ -282,10 +280,9 @@ impl Orchestrator {
                     if e.kind() == io::ErrorKind::BrokenPipe {
                         eprintln!("Connection to factory {} closed", name);
                         {
-                            if let Err(e) = factory_sender.send(FactoryChangeEvent::StatusChanged(
-                                uuid,
-                                FactoryStatus::Stopped,
-                            )) {
+                            if let Err(e) = factory_sender
+                                .send(FactoryChangeEvent::StatusChanged(uuid, FactoryStatus::Dead))
+                            {
                                 eprintln!("Failed to send unregistration event: {}", e);
                                 // Should be recoverable, since the socket got dropped anyway
                             }
@@ -403,10 +400,8 @@ impl Orchestrator {
                 eprintln!("Arc factories new length : {}", arc_factories.len());
 
                 if let Err(e) = factories_events_arc.send(FactoryChangeEvent::Added(uuid)) {
-                    map.update(uuid, |conn| FactoryConnection {
-                        name: conn.name.to_owned(),
-                        socket: Arc::clone(&conn.socket),
-                        status: FactoryStatus::Dead,
+                    map.update(uuid, |conn| {
+                        conn.get_copy_with_different_status(FactoryStatus::Dead)
                     });
                     return Err(RegistrationMessage::Error {
                         error: format!("Failed to send registration event: {}", e),
@@ -422,10 +417,8 @@ impl Orchestrator {
                 eprintln!("Unregistering factory {}", &factory_id);
 
                 let map = arc_factories.pin_owned();
-                map.update(factory_id, |conn| FactoryConnection {
-                    name: conn.name.to_owned(),
-                    socket: Arc::new(None.into()),
-                    status: FactoryStatus::Stopped,
+                map.update(factory_id, |conn| {
+                    conn.get_copy_with_different_status(FactoryStatus::Stopped)
                 });
 
                 if let Err(e) = factories_events_arc.send(FactoryChangeEvent::Removed(factory_id)) {
